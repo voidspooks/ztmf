@@ -3,7 +3,9 @@ package config
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"sync"
 
@@ -12,6 +14,19 @@ import (
 )
 
 var cfg *config
+
+// AuthProvider describes one OIDC issuer the API will accept tokens from.
+// Multiple providers support the HHS dual-IdP requirement (CMS Okta + HHS
+// Entra). Values are supplied at deploy time via the AUTH_PROVIDERS env var
+// (JSON array) or Secrets Manager; tenant-specific Entra values are tracked in
+// the internal epic (CMS-Enterprise/ztmf-misc#170).
+type AuthProvider struct {
+	Name        string `json:"name"`
+	Issuer      string `json:"issuer"`        // expected `iss` claim, matched verbatim (Entra includes the /v2.0 suffix)
+	TokenKeyUrl string `json:"token_key_url"` // JWKS URI when JWKS is true, else legacy per-kid PEM base URL
+	TenantID    string `json:"tenant_id"`     // optional: if set, the token `tid` claim must equal this (Entra tenant pinning)
+	JWKS        bool   `json:"jwks"`          // true: token_key_url is a JWKS JSON endpoint (RS256); false: legacy per-kid PEM (ES256)
+}
 
 type smtp struct {
 	User string `json:"user" env:"SMTP_USER"`
@@ -35,8 +50,12 @@ type config struct {
 	Region   string `env:"AWS_REGION" envDefault:"us-east-1"`
 	Auth     struct {
 		HS256_SECRET string `env:"AUTH_HS256_SECRET"`
-		TokenKeyUrl  string `env:"AUTH_TOKEN_KEY_URL"` // where to find the key that validates JWT
+		TokenKeyUrl  string `env:"AUTH_TOKEN_KEY_URL"` // legacy single-IdP key endpoint (ALB ES256 PEM); synthesizes a provider when AUTH_PROVIDERS is unset
 		HeaderField  string `env:"AUTH_HEADER_FIELD"`  // the header that includes encoded JWT from OIDC IDP
+		// ProvidersJSON is a JSON array of AuthProvider configs supplied at
+		// deploy time (env var or Secrets Manager). Parsed into Providers.
+		ProvidersJSON string         `env:"AUTH_PROVIDERS"`
+		Providers     []AuthProvider `env:"-"`
 	}
 	Db struct {
 		Host        string  `env:"DB_ENDPOINT"`
@@ -74,6 +93,11 @@ func GetInstance() *config {
 			err = env.Parse(cfg)
 			if err != nil {
 				log.Println("error parsing environment variables: ", err)
+				return
+			}
+
+			if err = cfg.initAuthProviders(); err != nil {
+				log.Println("error initializing auth providers: ", err)
 				return
 			}
 
@@ -148,4 +172,44 @@ func (c *config) IsLocal() bool {
 // test stack while just-in-time user creation deliberately does not.
 func (c *config) IsLocalOrTest() bool {
 	return c.Env == "local" || c.Env == "test"
+}
+
+// initAuthProviders populates Auth.Providers from the AUTH_PROVIDERS JSON env
+// var. For backward compatibility, if no providers are configured but the
+// legacy AUTH_TOKEN_KEY_URL is set, it synthesizes a single catch-all provider
+// so existing single-IdP deployments keep working with no config change.
+func (c *config) initAuthProviders() error {
+	if c.Auth.ProvidersJSON != "" {
+		if err := json.Unmarshal([]byte(c.Auth.ProvidersJSON), &c.Auth.Providers); err != nil {
+			return fmt.Errorf("parsing AUTH_PROVIDERS: %w", err)
+		}
+	}
+
+	if len(c.Auth.Providers) == 0 && c.Auth.TokenKeyUrl != "" {
+		c.Auth.Providers = []AuthProvider{{
+			Name:        "legacy",
+			TokenKeyUrl: c.Auth.TokenKeyUrl,
+		}}
+	}
+
+	return nil
+}
+
+// ProviderForIssuer returns the configured provider whose Issuer matches iss.
+// A provider with an empty Issuer acts as a catch-all (legacy single-IdP mode)
+// and is only returned when no issuer-specific provider matches. Returns nil
+// when the issuer is unknown, which callers treat as an authentication failure.
+func (c *config) ProviderForIssuer(iss string) *AuthProvider {
+	var catchAll *AuthProvider
+	for i := range c.Auth.Providers {
+		p := &c.Auth.Providers[i]
+		if p.Issuer == "" {
+			catchAll = p
+			continue
+		}
+		if p.Issuer == iss {
+			return p
+		}
+	}
+	return catchAll
 }

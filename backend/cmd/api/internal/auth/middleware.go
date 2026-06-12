@@ -36,17 +36,37 @@ func Middleware(next http.Handler) http.Handler {
 				return
 			}
 
-			user, err := model.FindUserByEmail(r.Context(), claims.Email)
+			// For multi-IdP (non-HS256) tokens, confirm the issuer maps to a
+			// configured provider and enforce any provider-specific claim
+			// constraints (Entra tenant pinning). HS256 local-dev tokens carry
+			// no issuer and skip this, preserving existing behavior.
+			if claims.Issuer != "" {
+				provider := cfg.ProviderForIssuer(claims.Issuer)
+				if provider == nil {
+					log.Printf("token from unknown issuer %q rejected\n", claims.Issuer)
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				if err := checkProviderClaims(provider, claims); err != nil {
+					log.Println(err)
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
+					return
+				}
+				log.Printf("request authenticated via provider %q for %s\n", provider.Name, userIdentifier(claims))
+			}
+
+			identifier := userIdentifier(claims)
+			user, err := model.FindUserByEmail(r.Context(), identifier)
 
 			if err != nil && cfg.IsLocal() {
-				log.Printf("Local dev: auto-creating OWNER user for %s\n", claims.Email)
+				log.Printf("Local dev: auto-creating OWNER user for %s\n", identifier)
 				user = &model.User{
-					Email:    claims.Email,
+					Email:    identifier,
 					FullName: claims.Name,
 					Role:     "OWNER",
 				}
 				if user.FullName == "" {
-					user.FullName = claims.Email
+					user.FullName = identifier
 				}
 				user, err = user.Save(r.Context())
 				if err != nil {
@@ -55,7 +75,7 @@ func Middleware(next http.Handler) http.Handler {
 					return
 				}
 			} else if err != nil {
-				log.Printf("Could not find user by email: %s with error %s\n", claims.Email, err)
+				log.Printf("Could not find user by email: %s with error %s\n", identifier, err)
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
